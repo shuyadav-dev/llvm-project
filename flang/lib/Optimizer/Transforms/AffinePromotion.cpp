@@ -286,8 +286,7 @@ private:
 /// Ensure a value is index-typed, inserting a fir.convert immediately after
 /// the value's definition point if needed.  Affine operations require all
 /// dimension and symbol operands to be of index type.
-static mlir::Value castToIndex(mlir::Value val,
-                               mlir::PatternRewriter &rewriter) {
+static mlir::Value castToIndex(mlir::Value val, mlir::PatternRewriter &rewriter) {
   if (val.getType().isIndex())
     return val;
   mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -295,8 +294,94 @@ static mlir::Value castToIndex(mlir::Value val,
     rewriter.setInsertionPointAfter(defOp);
   else if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(val))
     rewriter.setInsertionPointToStart(blockArg.getOwner());
-  return fir::ConvertOp::create(rewriter, val.getLoc(), rewriter.getIndexType(),
-                                val);
+  return fir::ConvertOp::create(rewriter, val.getLoc(),
+                                rewriter.getIndexType(), val);
+}
+
+static bool analyzeMemRef(mlir::Value memref, mlir::Operation *op,
+                          fir::DoLoopOp outermost = nullptr) {
+  if (auto acoOp = memref.getDefiningOp<ArrayCoorOp>()) {
+    if (mlir::isa<fir::BoxType>(acoOp.getMemref().getType())) {
+      // TODO: Look if and how fir.box can be promoted to affine.
+      LLVM_DEBUG(llvm::dbgs() << "analyzeMemRef: cannot promote, "
+                                 "array memory operation uses fir.box\n";
+                 op->dump(); acoOp.dump(););
+      return false;
+    }
+    // TODO: Support fir.array_coor with a fir.slice operand. The current
+    // promotion path only inspects acoOp.getShape() and silently ignores
+    // acoOp.getSlice(). Reject these loops until full slice
+    // support is implemented.
+    if (acoOp.getSlice()) {
+      LLVM_DEBUG(llvm::dbgs() << "analyzeMemRef: cannot promote, "
+                                 "fir.array_coor has a fir.slice operand "
+                                 "(not yet supported)\n";
+                 op->dump(); acoOp.dump(););
+      return false;
+    }
+
+    // Reject element types that `mlir::MemRefType` cannot hold (e.g.
+    // `!fir.char`) — promotion
+    // would later build an invalid `MemRefType`.
+    fir::SequenceType seqType;
+    mlir::Type baseTy = acoOp.getMemref().getType();
+    if (auto refTy = mlir::dyn_cast<fir::ReferenceType>(baseTy))
+      seqType = mlir::dyn_cast<fir::SequenceType>(refTy.getEleTy());
+    else if (auto heapTy = mlir::dyn_cast<fir::HeapType>(baseTy))
+      seqType = mlir::dyn_cast<fir::SequenceType>(heapTy.getEleTy());
+    if (!seqType ||
+        !mlir::MemRefType::isValidElementType(seqType.getEleTy())) {
+      LLVM_DEBUG(llvm::dbgs()
+                     << "analyzeMemRef: array element type is not a "
+                        "valid MemRef element type, cannot promote\n";
+                 op->dump(); acoOp.dump(););
+      return false;
+    }
+
+    // For fir.shape_shift, each LB becomes an affine symbol operand —
+    // reject any LB that isn't a valid affine symbol.
+    if (auto ssOp = acoOp.getShape().getDefiningOp<ShapeShiftOp>()) {
+      auto pairs = ssOp.getPairs();
+      for (unsigned i = 0, e = acoOp.getIndices().size(); i < e; ++i) {
+        assert(i * 2 < pairs.size() &&
+               "fir.array_coor / fir.shape_shift rank mismatch");
+        mlir::Value lb = pairs[i * 2];
+        if (!isAffineSymbolValue(lb, outermost)) {
+          LLVM_DEBUG(llvm::dbgs()
+                         << "analyzeMemRef: cannot promote, "
+                            "fir.shape_shift lower bound is not a valid "
+                            "affine symbol\n";
+                     op->dump(); ssOp.dump(); lb.dump(););
+          return false;
+        }
+      }
+    }
+    bool canPromote = true;
+    for (auto coordinate : acoOp.getIndices())
+      canPromote = canPromote && isAffineIndex(coordinate, outermost);
+    return canPromote;
+  }
+  if (auto coOp = memref.getDefiningOp<CoordinateOp>()) {
+    LLVM_DEBUG(llvm::dbgs() << "analyzeMemRef: cannot promote, "
+                               "array memory operation uses non ArrayCoorOp\n";
+               op->dump(); coOp.dump(););
+    return false;
+  }
+  LLVM_DEBUG(llvm::dbgs() << "analyzeMemRef: unknown type of memory "
+                             "reference for load/store\n";
+             op->dump(););
+  return false;
+}
+
+static bool analyzeRegionMemoryAccess(mlir::Region &region,
+                                      fir::DoLoopOp outermost = nullptr) {
+  for (auto loadOp : region.getOps<fir::LoadOp>())
+    if (!analyzeMemRef(loadOp.getMemref(), loadOp, outermost))
+      return false;
+  for (auto storeOp : region.getOps<fir::StoreOp>())
+    if (!analyzeMemRef(storeOp.getMemref(), storeOp, outermost))
+      return false;
+  return true;
 }
 
 namespace {
@@ -309,25 +394,6 @@ struct AffineLoopAnalysis {
   bool canPromoteToAffine() { return legality; }
 
 private:
-  bool analyzeBody(fir::DoLoopOp loopOperation,
-                   AffineFunctionAnalysis &functionAnalysis) {
-    for (auto loopOp : loopOperation.getOps<fir::DoLoopOp>()) {
-      auto analysis = functionAnalysis.loopAnalysisMap
-                          .try_emplace(loopOp, loopOp, functionAnalysis)
-                          .first->getSecond();
-      if (!analysis.canPromoteToAffine())
-        return false;
-    }
-    // Reject loops containing fir.if until full fir.if → affine.if
-    // promotion is available.
-    if (!loopOperation.getOps<fir::IfOp>().empty()) {
-      LLVM_DEBUG(llvm::dbgs() << "AffineLoopAnalysis: loop contains fir.if, "
-                                 "skipping (if-promotion not yet enabled)\n");
-      return false;
-    }
-    return true;
-  }
-
   bool analysisResults(fir::DoLoopOp loopOperation) {
     if (loopOperation.getFinalValue() &&
         !loopOperation.getResult(0).use_empty()) {
@@ -340,6 +406,9 @@ private:
     return true;
   }
 
+  bool analyzeBody(fir::DoLoopOp loopOperation,
+                   AffineFunctionAnalysis &functionAnalysis);
+
   bool analyzeLoop(fir::DoLoopOp loopOperation,
                    AffineFunctionAnalysis &functionAnalysis) {
     LLVM_DEBUG(llvm::dbgs() << "AffineLoopAnalysis: \n"; loopOperation.dump(););
@@ -350,117 +419,36 @@ private:
            analyzeBody(loopOperation, functionAnalysis);
   }
 
-  bool analyzeReference(mlir::Value memref, mlir::Operation *op,
-                        fir::DoLoopOp outermost) {
-    if (auto acoOp = memref.getDefiningOp<ArrayCoorOp>()) {
-      if (mlir::isa<fir::BoxType>(acoOp.getMemref().getType())) {
-        // TODO: Look if and how fir.box can be promoted to affine.
-        LLVM_DEBUG(llvm::dbgs() << "AffineLoopAnalysis: cannot promote loop, "
-                                   "array memory operation uses fir.box\n";
-                   op->dump(); acoOp.dump(););
-        return false;
-      }
-      // TODO: Support fir.array_coor with a fir.slice operand. The current
-      // promotion path only inspects acoOp.getShape() and silently ignores
-      // acoOp.getSlice(). Reject these loops until full slice
-      // support is implemented.
-      if (acoOp.getSlice()) {
-        LLVM_DEBUG(llvm::dbgs() << "AffineLoopAnalysis: cannot promote loop, "
-                                   "fir.array_coor has a fir.slice operand "
-                                   "(not yet supported)\n";
-                   op->dump(); acoOp.dump(););
-        return false;
-      }
-
-      // Reject element types that `mlir::MemRefType` cannot hold (e.g.
-      // `!fir.char`) — promotion
-      // would later build an invalid `MemRefType`.
-      fir::SequenceType seqType;
-      mlir::Type baseTy = acoOp.getMemref().getType();
-      if (auto refTy = mlir::dyn_cast<fir::ReferenceType>(baseTy))
-        seqType = mlir::dyn_cast<fir::SequenceType>(refTy.getEleTy());
-      else if (auto heapTy = mlir::dyn_cast<fir::HeapType>(baseTy))
-        seqType = mlir::dyn_cast<fir::SequenceType>(heapTy.getEleTy());
-      if (!seqType ||
-          !mlir::MemRefType::isValidElementType(seqType.getEleTy())) {
-        LLVM_DEBUG(llvm::dbgs()
-                       << "AffineLoopAnalysis: array element type is not a "
-                          "valid MemRef element type, cannot promote\n";
-                   op->dump(); acoOp.dump(););
-        return false;
-      }
-
-      // For fir.shape_shift, each LB becomes an affine symbol operand —
-      // reject any LB that isn't a valid affine symbol.
-      if (auto ssOp = acoOp.getShape().getDefiningOp<ShapeShiftOp>()) {
-        auto pairs = ssOp.getPairs();
-        for (unsigned i = 0, e = acoOp.getIndices().size(); i < e; ++i) {
-          assert(i * 2 < pairs.size() &&
-                 "fir.array_coor / fir.shape_shift rank mismatch");
-          mlir::Value lb = pairs[i * 2];
-          if (!isAffineSymbolValue(lb, outermost)) {
-            LLVM_DEBUG(llvm::dbgs()
-                           << "AffineLoopAnalysis: cannot promote loop, "
-                              "fir.shape_shift lower bound is not a valid "
-                              "affine symbol\n";
-                       op->dump(); ssOp.dump(); lb.dump(););
-            return false;
-          }
-        }
-      }
-      bool canPromote = true;
-      for (auto coordinate : acoOp.getIndices())
-        canPromote = canPromote && isAffineIndex(coordinate, outermost);
-      return canPromote;
-    }
-    if (auto coOp = memref.getDefiningOp<CoordinateOp>()) {
-      LLVM_DEBUG(llvm::dbgs()
-                     << "AffineLoopAnalysis: cannot promote loop, "
-                        "array memory operation uses non ArrayCoorOp\n";
-                 op->dump(); coOp.dump(););
-
-      return false;
-    }
-    LLVM_DEBUG(llvm::dbgs() << "AffineLoopAnalysis: unknown type of memory "
-                               "reference for array load\n";
-               op->dump(););
-    return false;
-  }
-
   bool analyzeMemoryAccess(fir::DoLoopOp loopOperation,
                            fir::DoLoopOp outermost) {
-    for (auto loadOp : loopOperation.getOps<fir::LoadOp>())
-      if (!analyzeReference(loadOp.getMemref(), loadOp, outermost))
-        return false;
-    for (auto storeOp : loopOperation.getOps<fir::StoreOp>())
-      if (!analyzeReference(storeOp.getMemref(), storeOp, outermost))
-        return false;
-    return true;
+    return analyzeRegionMemoryAccess(loopOperation.getRegion(), outermost);
   }
 
-  bool analyzeBounds(fir::DoLoopOp loopOperation, fir::DoLoopOp outermost) {
+  bool analyzeBounds(fir::DoLoopOp loopOperation,
+                     fir::DoLoopOp outermost) {
     // Only promote loops with a positive constant step. The genericBounds
     // fallback (which attempts to handle variable/negative steps) is broken
     // — see the comment on that function — so we reject everything that
     // positiveConstantStep cannot handle.
     bool hasPositiveConstantStep = false;
-    if (auto defOp =
-            loopOperation.getStep().getDefiningOp<mlir::arith::ConstantOp>())
+    if (auto defOp = loopOperation.getStep()
+                          .getDefiningOp<mlir::arith::ConstantOp>())
       if (auto attr = mlir::dyn_cast<IntegerAttr>(defOp.getValue()))
         hasPositiveConstantStep = attr.getInt() > 0;
     if (!hasPositiveConstantStep) {
-      LLVM_DEBUG(llvm::dbgs() << "AffineLoopAnalysis: step is not a positive "
-                                 "constant, cannot promote\n");
+      LLVM_DEBUG(llvm::dbgs()
+                     << "AffineLoopAnalysis: step is not a positive "
+                        "constant, cannot promote\n");
       return false;
     }
     if (!isAffineIndex(loopOperation.getLowerBound(), outermost)) {
       LLVM_DEBUG(llvm::dbgs()
-                 << "AffineLoopAnalysis: lower bound not affine\n");
+                     << "AffineLoopAnalysis: lower bound not affine\n");
       return false;
     }
     if (!isAffineIndex(loopOperation.getUpperBound(), outermost)) {
       LLVM_DEBUG(llvm::dbgs()
-                 << "AffineLoopAnalysis: upper bound not affine\n");
+                     << "AffineLoopAnalysis: upper bound not affine\n");
       return false;
     }
     return true;
@@ -489,7 +477,9 @@ namespace {
 struct AffineIfCondition {
   using MaybeAffineExpr = std::optional<mlir::AffineExpr>;
 
-  explicit AffineIfCondition(mlir::Value fc) : firCondition(fc) {
+  explicit AffineIfCondition(mlir::Value fc,
+                             fir::DoLoopOp outermost = nullptr)
+      : firCondition(fc), outermostLoop(outermost) {
     if (auto condDef = firCondition.getDefiningOp<mlir::arith::CmpIOp>())
       fromCmpIOp(condDef);
   }
@@ -526,6 +516,8 @@ private:
   /// in an affine expression, this includes -, +, *, rem, constant.
   /// block arguments of a loopOp or forOp are used as dimensions
   MaybeAffineExpr toAffineExpr(mlir::Value value) {
+    if (auto conv = value.getDefiningOp<fir::ConvertOp>())
+      return toAffineExpr(conv.getValue());
     if (auto op = value.getDefiningOp<mlir::arith::SubIOp>())
       return affineBinaryOp(
           mlir::AffineExprKind::Add, toAffineExpr(op.getLhs()),
@@ -534,21 +526,45 @@ private:
     if (auto op = value.getDefiningOp<mlir::arith::AddIOp>())
       return affineBinaryOp(mlir::AffineExprKind::Add, op.getLhs(),
                             op.getRhs());
-    if (auto op = value.getDefiningOp<mlir::arith::MulIOp>())
-      return affineBinaryOp(mlir::AffineExprKind::Mul, op.getLhs(),
-                            op.getRhs());
-    if (auto op = value.getDefiningOp<mlir::arith::RemUIOp>())
-      return affineBinaryOp(mlir::AffineExprKind::Mod, op.getLhs(),
-                            op.getRhs());
+    if (auto op = value.getDefiningOp<mlir::arith::MulIOp>()) {
+      auto lhs = toAffineExpr(op.getLhs());
+      auto rhs = toAffineExpr(op.getRhs());
+      if (!lhs || !rhs)
+        return {};
+      if (!llvm::isa<mlir::AffineConstantExpr>(*lhs) &&
+          !llvm::isa<mlir::AffineConstantExpr>(*rhs))
+        return {};
+      return *lhs * *rhs;
+    }
+    if (auto op = value.getDefiningOp<mlir::arith::RemUIOp>()) {
+      auto lhs = toAffineExpr(op.getLhs());
+      auto rhs = toAffineExpr(op.getRhs());
+      if (!lhs || !rhs || !llvm::isa<mlir::AffineConstantExpr>(*rhs))
+        return {};
+      return *lhs % *rhs;
+    }
     if (auto op = value.getDefiningOp<mlir::arith::ConstantOp>())
       if (auto intConstant = mlir::dyn_cast<IntegerAttr>(op.getValue()))
         return toAffineExpr(intConstant.getInt());
     if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
-      affineArgs.push_back(value);
-      if (isa<fir::DoLoopOp>(blockArg.getOwner()->getParentOp()) ||
-          isa<mlir::affine::AffineForOp>(blockArg.getOwner()->getParentOp()))
+      auto *parentOp = blockArg.getOwner()->getParentOp();
+      if (isa<fir::DoLoopOp>(parentOp) ||
+          isa<mlir::affine::AffineForOp>(parentOp)) {
+        affineArgs.push_back(value);
         return {mlir::getAffineDimExpr(dimCount++, value.getContext())};
-      return {mlir::getAffineSymbolExpr(symCount++, value.getContext())};
+      }
+      if (outermostLoop && !outermostLoop->isAncestor(parentOp)) {
+        affineArgs.push_back(value);
+        return {mlir::getAffineSymbolExpr(symCount++, value.getContext())};
+      }
+      return {};
+    }
+    if (outermostLoop) {
+      auto *defOp = value.getDefiningOp();
+      if (defOp && !outermostLoop->isAncestor(defOp)) {
+        affineArgs.push_back(value);
+        return {mlir::getAffineSymbolExpr(symCount++, value.getContext())};
+      }
     }
     return {};
   }
@@ -574,7 +590,7 @@ private:
     case mlir::arith::CmpIPredicate::sle:
       return {std::make_pair(basic, false)};
     case mlir::arith::CmpIPredicate::sgt:
-      return {std::make_pair(1 - basic, false)};
+      return {std::make_pair(-1 - basic, false)};
     case mlir::arith::CmpIPredicate::sge:
       return {std::make_pair(0 - basic, false)};
     case mlir::arith::CmpIPredicate::eq:
@@ -587,6 +603,7 @@ private:
   llvm::SmallVector<mlir::Value> affineArgs;
   std::optional<mlir::IntegerSet> integerSet;
   mlir::Value firCondition;
+  fir::DoLoopOp outermostLoop;
   unsigned symCount{0u};
   unsigned dimCount{0u};
 };
@@ -603,13 +620,8 @@ struct AffineIfAnalysis {
   bool canPromoteToAffine() { return legality; }
 
 private:
-  bool analyzeIf(fir::IfOp op, AffineFunctionAnalysis &afa) {
-    if (op.getNumResults() == 0)
-      return true;
-    LLVM_DEBUG(llvm::dbgs()
-                   << "AffineIfAnalysis: not promoting as op has results\n";);
-    return false;
-  }
+  bool analyzeIf(fir::IfOp op, AffineFunctionAnalysis &afa);
+
 
   bool legality{};
 };
@@ -621,10 +633,59 @@ AffineFunctionAnalysis::getChildIfAnalysis(fir::IfOp op) const {
   if (it == ifAnalysisMap.end()) {
     LLVM_DEBUG(llvm::dbgs() << "AffineFunctionAnalysis: not computed for:\n";
                op.dump(););
-
     return {};
   }
   return it->getSecond();
+}
+
+static bool analyzeBodyChildren(mlir::Region &region,
+                                AffineFunctionAnalysis &afa) {
+  for (auto loopOp : region.getOps<fir::DoLoopOp>()) {
+    auto analysis = afa.loopAnalysisMap
+                        .try_emplace(loopOp, loopOp, afa)
+                        .first->getSecond();
+    if (!analysis.canPromoteToAffine())
+      return false;
+  }
+  for (auto ifOp : region.getOps<fir::IfOp>()) {
+    auto analysis = afa.ifAnalysisMap
+                        .try_emplace(ifOp, ifOp, afa)
+                        .first->getSecond();
+    if (!analysis.canPromoteToAffine())
+      return false;
+  }
+  return true;
+}
+
+bool AffineLoopAnalysis::analyzeBody(
+    fir::DoLoopOp loopOperation,
+    AffineFunctionAnalysis &functionAnalysis) {
+  return analyzeBodyChildren(loopOperation.getRegion(), functionAnalysis);
+}
+
+bool AffineIfAnalysis::analyzeIf(fir::IfOp op, AffineFunctionAnalysis &afa) {
+  if (op.getNumResults() != 0) {
+    LLVM_DEBUG(llvm::dbgs()
+                   << "AffineIfAnalysis: not promoting as op has results\n";);
+    return false;
+  }
+  fir::DoLoopOp outermost;
+  if (auto parentLoop = op->getParentOfType<fir::DoLoopOp>())
+    outermost = afa.getOutermostLoop(parentLoop);
+  AffineIfCondition condition(op.getCondition(), outermost);
+  if (!condition.hasIntegerSet()) {
+    LLVM_DEBUG(llvm::dbgs()
+                   << "AffineIfAnalysis: condition is not affine\n";);
+    return false;
+  }
+  if (!analyzeRegionMemoryAccess(op.getThenRegion(), outermost) ||
+      !analyzeBodyChildren(op.getThenRegion(), afa))
+    return false;
+  if (!op.getElseRegion().empty() &&
+      (!analyzeRegionMemoryAccess(op.getElseRegion(), outermost) ||
+       !analyzeBodyChildren(op.getElseRegion(), afa)))
+    return false;
+  return true;
 }
 
 static std::optional<int64_t> constantIntegerLike(const mlir::Value value) {
@@ -687,8 +748,8 @@ createMultiDimAffineOps(mlir::Value arrayRef, mlir::PatternRewriter &rewriter,
       auto expr = builder.build(idx);
       assert(expr && "analysis guaranteed index is affine");
       auto adjustedExpr = *expr - 1;
-      auto map = mlir::AffineMap::get(builder.dims.size(), builder.syms.size(),
-                                      adjustedExpr);
+      auto map = mlir::AffineMap::get(builder.dims.size(),
+                                      builder.syms.size(), adjustedExpr);
       auto operands = buildOperands(builder);
       auto adjusted =
           affine::AffineApplyOp::create(rewriter, loc, map, operands);
@@ -715,7 +776,7 @@ createMultiDimAffineOps(mlir::Value arrayRef, mlir::PatternRewriter &rewriter,
   } else {
     llvm::report_fatal_error(
         "unsupported fir.array_coor shape kind; "
-        "AffineLoopAnalysis::analyzeReference should have rejected this");
+        "analyzeMemRef should have rejected this");
   }
 
   // need reverse because memref is row major order but fir.array is column
@@ -728,24 +789,23 @@ createMultiDimAffineOps(mlir::Value arrayRef, mlir::PatternRewriter &rewriter,
 static void rewriteLoad(fir::LoadOp loadOp, mlir::PatternRewriter &rewriter,
                         fir::DoLoopOp outermost) {
   rewriter.setInsertionPoint(loadOp);
-  auto result =
-      createMultiDimAffineOps(loadOp.getMemref(), rewriter, outermost);
+  auto result = createMultiDimAffineOps(loadOp.getMemref(), rewriter, outermost);
   rewriter.replaceOpWithNewOp<affine::AffineLoadOp>(
       loadOp, result.arrayConvert.getResult(), result.indices);
 }
 
-static void rewriteStore(fir::StoreOp storeOp, mlir::PatternRewriter &rewriter,
+static void rewriteStore(fir::StoreOp storeOp,
+                         mlir::PatternRewriter &rewriter,
                          fir::DoLoopOp outermost) {
   rewriter.setInsertionPoint(storeOp);
-  auto result =
-      createMultiDimAffineOps(storeOp.getMemref(), rewriter, outermost);
+  auto result = createMultiDimAffineOps(storeOp.getMemref(), rewriter, outermost);
   rewriter.replaceOpWithNewOp<affine::AffineStoreOp>(
       storeOp, storeOp.getValue(), result.arrayConvert.getResult(),
       result.indices);
 }
 
 static void rewriteMemoryOps(Block *block, mlir::PatternRewriter &rewriter,
-                             fir::DoLoopOp outermost = {}) {
+                              fir::DoLoopOp outermost) {
   for (auto &bodyOp : llvm::make_early_inc_range(block->getOperations())) {
     if (isa<fir::LoadOp>(bodyOp))
       rewriteLoad(cast<fir::LoadOp>(bodyOp), rewriter, outermost);
@@ -930,17 +990,33 @@ public:
                op.dump(););
     if (!functionAnalysis.getChildIfAnalysis(op).canPromoteToAffine())
       return rewriter.notifyMatchFailure(op, "cannot promote to affine");
-    auto &ifOps = op.getThenRegion().front().getOperations();
-    auto affineCondition = AffineIfCondition(op.getCondition());
-    if (!affineCondition.hasIntegerSet()) {
-      LLVM_DEBUG(
-          llvm::dbgs()
-              << "AffineIfConversion: couldn't calculate affine condition\n";);
-      return failure();
+
+    fir::DoLoopOp outermost;
+    for (auto *parent = op->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (auto parentLoop = dyn_cast<fir::DoLoopOp>(parent)) {
+        auto parentAnalysis =
+            functionAnalysis.getChildLoopAnalysis(parentLoop);
+        if (!parentAnalysis.canPromoteToAffine())
+          return rewriter.notifyMatchFailure(
+              op, "enclosing fir.do_loop is not promotable");
+        if (!outermost)
+          outermost = functionAnalysis.getOutermostLoop(parentLoop);
+      }
     }
+
+    auto &ifOps = op.getThenRegion().front().getOperations();
+    auto affineCondition = AffineIfCondition(op.getCondition(), outermost);
+    assert(affineCondition.hasIntegerSet() &&
+           "analysis guaranteed condition is affine");
+
+    llvm::SmallVector<mlir::Value> castArgs;
+    for (auto arg : affineCondition.getAffineArgs())
+      castArgs.push_back(castToIndex(arg, rewriter));
+
     auto affineIf = affine::AffineIfOp::create(
         rewriter, op.getLoc(), affineCondition.getIntegerSet(),
-        affineCondition.getAffineArgs(), !op.getElseRegion().empty());
+        castArgs, !op.getElseRegion().empty());
     rewriter.startOpModification(affineIf);
     affineIf.getThenBlock()->getOperations().splice(
         std::prev(affineIf.getThenBlock()->end()), ifOps, ifOps.begin(),
@@ -952,7 +1028,9 @@ public:
           std::prev(otherOps.end()));
     }
     rewriter.finalizeOpModification(affineIf);
-    rewriteMemoryOps(affineIf.getBody(), rewriter);
+    rewriteMemoryOps(affineIf.getBody(), rewriter, outermost);
+    if (affineIf.hasElse())
+      rewriteMemoryOps(affineIf.getElseBlock(), rewriter, outermost);
 
     LLVM_DEBUG(llvm::dbgs() << "AffineIfConversion: if converted to:\n";
                affineIf.dump(););
