@@ -106,25 +106,21 @@ func.func @loop_with_if(%a: !arr_d1, %v: f32) {
   }
   return
 }
-// Loops containing fir.if are not promoted (if-promotion deferred to a later patch).
-// The entire nest stays as fir.do_loop.
-// CHECK: func @loop_with_if(%[[VAL_0:.*]]: !fir.ref<!fir.array<?xf32>>, %[[VAL_1:.*]]: f32) {
-// CHECK:   %[[C0:.*]] = arith.constant 0 : index
-// CHECK:   %[[C1:.*]] = arith.constant 1 : index
+// CHECK: func @loop_with_if(%[[ARR:.*]]: !fir.ref<!fir.array<?xf32>>, %[[V:.*]]: f32) {
 // CHECK:   %[[C2:.*]] = arith.constant 2 : index
 // CHECK:   %[[C100:.*]] = arith.constant 100 : index
 // CHECK:   %[[DIMS:.*]] = fir.shape %[[C100]] : (index) -> !fir.shape<1>
-// CHECK:   fir.do_loop %[[I:.*]] = %[[C1]] to %[[C100]] step %[[C1]] {
-// CHECK:     fir.do_loop %[[J:.*]] = %[[C1]] to %[[C100]] step %[[C1]] {
-// CHECK:       fir.do_loop %[[K:.*]] = %[[C1]] to %[[C100]] step %[[C1]] {
-// CHECK:         %[[IM2:.*]] = arith.subi %[[I]], %[[C2]] : index
-// CHECK:         %[[COND:.*]] = arith.cmpi sgt, %[[IM2]], %[[C0]] : index
-// CHECK:         fir.if %[[COND]] {
-// CHECK:           fir.store %[[VAL_1]] to %{{.*}} : !fir.ref<f32>
-// CHECK:         }
-// CHECK:         fir.store %[[VAL_1]] to %{{.*}} : !fir.ref<f32>
-// CHECK:         fir.store %[[VAL_1]] to %{{.*}} : !fir.ref<f32>
-// CHECK:       }
+// CHECK:   %[[MEM:.*]] = fir.convert %[[ARR]] : (!fir.ref<!fir.array<?xf32>>) -> memref<?xf32>
+// CHECK:   affine.for %[[J:.*]] = 1 to 101 {
+// CHECK:     affine.store %[[V]], %[[MEM]][%{{.*}}] : memref<?xf32>
+// CHECK:   }
+// CHECK:   affine.for %[[K:.*]] = 1 to 101 {
+// CHECK:     affine.store %[[V]], %[[MEM]][%{{.*}}] : memref<?xf32>
+// CHECK:   }
+// CHECK:   affine.for %[[I:.*]] = 1 to 101 {
+// CHECK:     %{{.*}} = arith.subi %[[I]], %[[C2]] : index
+// CHECK:     affine.if #set(%[[I]]) {
+// CHECK:       affine.store %[[V]], %[[MEM]][%{{.*}}] : memref<?xf32>
 // CHECK:     }
 // CHECK:   }
 // CHECK:   return
